@@ -1,0 +1,8 @@
+python-telegram-bot==20.3
+pandas
+xlsxwriter
+json
+datetime
+shutil
+os
+logging
