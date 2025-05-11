@@ -44,6 +44,7 @@ ASK_QUESTION, ASK_OPTIONS, ASK_GROUP_IDS_CREATE = range(3)
 MANAGE_LIST_QUESTIONS, SELECT_MANAGE_ACTION, ASK_SHARE_GROUP_ID, CONFIRM_DELETE = range(3, 7)
 # حالات عرض الإجابات
 SELECT_QUESTION = 7
+AWAITING_REPLY = 8
 
 # قاموس لحفظ الأسئلة وإجابات الطلاب
 questions_db = {}  # سيخزن {question_id: {'question': text, 'options': [], 'answers': {user_id: {'answer': answer, 'name': name, 'username': username}}}}
@@ -51,7 +52,12 @@ question_counter = 1  # عداد للأسئلة يبدأ من 1
 
 # معرفات المشرفين المسموح لهم باستخدام البوت (يمكن إضافة معرفات أو أرقام)
 ALLOWED_USERS = [1687347144]  # معرفات رقمية
-ALLOWED_USERNAMES = ["memovq", "omr_taher", "Mohameddammar"]  # معرفات نصية
+ALLOWED_USERNAMES = ["omr_taher", "Mohameddammar"]  # معرفات نصية
+
+# --- متغيرات إضافية للرسائل ---
+user_messages = {}  # {message_id: {'user_id': int, 'name': str, 'username': str, 'message': str, 'timestamp': str, 'replied': bool}}
+message_counter = 1
+user_message_counts = {}  # Track number of messages per user: {user_id: count}
 
 # --- وظائف إدارة البيانات ---
 
@@ -81,10 +87,13 @@ async def unauthorized_access(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def save_data():
     """حفظ البيانات في ملف JSON."""
-    global questions_db, question_counter
+    global questions_db, question_counter, user_messages, message_counter, user_message_counts
     data = {
         'questions_db': questions_db,
         'question_counter': question_counter,
+        'user_messages': user_messages,
+        'message_counter': message_counter,
+        'user_message_counts': user_message_counts,
         'last_saved': datetime.datetime.now().isoformat()
     }
 
@@ -116,7 +125,7 @@ def save_data():
 
 def load_data():
     """تحميل البيانات من ملف JSON."""
-    global questions_db, question_counter
+    global questions_db, question_counter, user_messages, message_counter, user_message_counts
 
     # التحقق من وجود ملف البيانات
     if os.path.exists('quiz_data.json'):
@@ -125,17 +134,26 @@ def load_data():
                 data = json.load(f)
                 questions_db = data.get('questions_db', {})
                 question_counter = data.get('question_counter', 1)
-            logger.info(f"تم تحميل البيانات بنجاح. عدد الأسئلة: {len(questions_db)}, المعرف التالي: {question_counter}")
+                user_messages = data.get('user_messages', {})
+                message_counter = data.get('message_counter', 1)
+                user_message_counts = data.get('user_message_counts', {})
+            logger.info(f"تم تحميل البيانات بنجاح. عدد الأسئلة: {len(questions_db)}, عدد الرسائل: {len(user_messages)}")
             return True
         except Exception as e:
             logger.error(f"حدث خطأ أثناء تحميل البيانات: {e}")
             questions_db = {}
             question_counter = 1
+            user_messages = {}
+            message_counter = 1
+            user_message_counts = {}
             return False
     else:
         logger.info("ملف البيانات غير موجود، سيتم إنشاء بيانات جديدة")
         questions_db = {}
         question_counter = 1
+        user_messages = {}
+        message_counter = 1
+        user_message_counts = {}
         return True
 
 def renumber_questions():
@@ -953,6 +971,202 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error exporting data to Excel: {e}", exc_info=True)
         await update.message.reply_text(f"⚠️ حدث خطأ أثناء تصدير البيانات: {e}")
 
+# --- وظائف الرسائل ---
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة رسائل المستخدمين غير المصرح لهم"""
+    global message_counter, user_messages, user_message_counts
+    
+    # Check if this is a private chat with the bot
+    if update.message.chat.type != "private":
+        return
+    
+    user = update.message.from_user
+    
+    if not is_authorized(user):
+        message = update.message.text.strip()
+        
+        message_id = str(message_counter)
+        user_messages[message_id] = {
+            'user_id': user.id,
+            'name': f"{user.first_name} {user.last_name or ''}".strip(),
+            'username': user.username or "غير متوفر",
+            'message': message,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'replied': False
+        }
+        
+        # Update user message count
+        user_message_counts[user.id] = user_message_counts.get(user.id, 0) + 1
+        
+        message_counter += 1
+        save_data()  # Save after adding new message
+        await update.message.reply_text("أرسلت رسالتك بنجاح.")
+        context.user_data['awaiting_message'] = True  # Keep accepting messages
+
+async def list_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قائمة المستخدمين ورسائلهم"""
+    if not is_authorized(update.message.from_user):
+        return await unauthorized_access(update, context)
+
+    if not user_messages:
+        await update.message.reply_text("لا توجد رسائل جديدة.")
+        return
+
+    # Group messages by user
+    users = {}
+    for msg_id, data in user_messages.items():
+        user_id = data['user_id']
+        if user_id not in users:
+            users[user_id] = {
+                'name': data['name'],
+                'username': data['username'],
+                'count': user_message_counts.get(user_id, 1)
+            }
+
+    # Create inline keyboard with user list
+    keyboard = []
+    for user_id, user_data in users.items():
+        btn_text = f"{user_data['name']} (@{user_data['username']}) - {user_data['count']} رسائل"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"show_msgs:{user_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("اختر المستخدم لعرض رسائله:", reply_markup=reply_markup)
+
+async def show_user_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض رسائل مستخدم محدد"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.data.split(':')[1]
+    
+    # Get all messages from this user
+    user_msgs = []
+    keyboard = []
+    
+    for msg_id, data in user_messages.items():
+        if str(data['user_id']) == user_id:
+            status = "✅" if data['replied'] else "❌"
+            user_msgs.append(
+                f"رسالة #{msg_id} {status}\n"
+                f"الرسالة: {data['message']}\n"
+                f"التاريخ: {data['timestamp']}"
+            )
+            if not data['replied']:
+                keyboard.append([
+                    InlineKeyboardButton(f"الرد على رسالة #{msg_id}", callback_data=f"reply:{msg_id}"),
+                    InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_msg:{msg_id}")
+                ])
+            else:
+                keyboard.append([InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_msg:{msg_id}")])
+
+    keyboard.append([InlineKeyboardButton("« رجوع", callback_data="back_to_users")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(
+            "\n───────────────\n".join(user_msgs) if user_msgs else "لا توجد رسائل",
+            reply_markup=reply_markup
+        )
+    except TelegramError as e:
+        logger.error(f"Error showing user messages: {e}")
+        await query.message.reply_text("حدث خطأ في عرض الرسائل")
+
+async def delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف رسالة مستخدم"""
+    query = update.callback_query
+    await query.answer()
+
+    msg_id = query.data.split(':')[1]
+    if msg_id in user_messages:
+        user_id = user_messages[msg_id]['user_id']
+        user_message_counts[user_id] = max(0, user_message_counts.get(user_id, 1) - 1)
+        del user_messages[msg_id]
+        save_data()  # Save after deleting message
+        # Return to user messages view
+        await show_user_messages(update, context)
+
+async def back_to_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """العودة لقائمة المستخدمين"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_authorized(query.from_user):
+        return await unauthorized_access(update, context)
+    
+    # Group messages by user
+    users = {}
+    for msg_id, data in user_messages.items():
+        user_id = data['user_id']
+        if user_id not in users:
+            users[user_id] = {
+                'name': data['name'],
+                'username': data['username'],
+                'count': user_message_counts.get(user_id, 1)
+            }
+
+    # Create inline keyboard with user list
+    keyboard = []
+    for user_id, user_data in users.items():
+        btn_text = f"{user_data['name']} (@{user_data['username']}) - {user_data['count']} رسائل"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"show_msgs:{user_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(
+            "اختر المستخدم لعرض رسائله:",
+            reply_markup=reply_markup
+        )
+    except TelegramError as e:
+        logger.error(f"Error returning to users list: {e}")
+        await query.message.reply_text("حدث خطأ في العودة للقائمة")
+
+# --- وظائف الرد على الرسائل ---
+
+async def start_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء الرد على رسالة معينة."""
+    query = update.callback_query
+    await query.answer()
+
+    msg_id = query.data.split(':')[1]
+    if msg_id not in user_messages:
+        await query.edit_message_text("الرسالة غير موجودة أو تم حذفها.")
+        return ConversationHandler.END
+
+    context.user_data['reply_to_msg_id'] = msg_id
+    await query.edit_message_text("اكتب الرد على الرسالة أو استخدم /cancel لإلغاء العملية.")
+    return AWAITING_REPLY
+
+async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال الرد على الرسالة."""
+    msg_id = context.user_data.get('reply_to_msg_id')
+    if not msg_id or msg_id not in user_messages:
+        await update.message.reply_text("الرسالة غير موجودة أو تم حذفها.")
+        return ConversationHandler.END
+
+    reply_text = update.message.text.strip()
+    user_id = user_messages[msg_id]['user_id']
+
+    try:
+        # Format the reply message with the prefix
+        formatted_reply = f"الرد من الإدارة:\n\n{reply_text}"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=formatted_reply
+        )
+        user_messages[msg_id]['replied'] = True
+        save_data()  # Save after marking message as replied
+        await update.message.reply_text("تم إرسال الرد بنجاح.")
+        
+        # Show the users list again
+        await list_messages(update, context)
+        return ConversationHandler.END
+    except TelegramError as e:
+        logger.error(f"Error sending reply to user {user_id}: {e}")
+        await update.message.reply_text("حدث خطأ أثناء إرسال الرد.")
+        return ConversationHandler.END
+
 # --- وظائف عامة ---
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -974,23 +1188,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعرض رسالة الترحيب والأوامر المتاحة."""
+    """يعرض رسالة الترحيب أو يتيح إرسال رسالة للدعم."""
     user = update.message.from_user
 
     if not is_authorized(user):
-        await update.message.reply_text(
-            "مرحبًا بك في بوت آل بصيص. عذرًا، لا تمتلك صلاحيات لاستخدام هذا البوت.\n"
-            "إذا كنت تعتقد أن هذا خطأ، يرجى التواصل مع مدير البوت."
-        )
+        await update.message.reply_text("تفضل بإرسال رسالتك إلى دعم مجتمع بصيص \nوأرفق اسمك ثلاثيا أول الرسالة.")
+        context.user_data['awaiting_message'] = True
         return
 
     await update.message.reply_text(
         f"أهلاً {user.first_name}! مرحبًا بك في بوت آل بصيص المُطور 🌟\n\n"
         "الأوامر المتوفرة:\n"
         "◾️ /ask - إنشاء سؤال جديد\n"
-        "◾️ /list - عرض الأسئلة وإدارتها (مشاركة/حذف/عرض الإجابات)\n"
+        "◾️ /list - عرض الأسئلة وإدارتها\n"
         "◾️ /cancel - لإلغاء العملية الحالية\n"
-        "◾️ /export - تصدير بيانات الأسئلة والإجابات\n"
+        "◾️ /export - تصدير البيانات\n"
+        "◾️ /messages - عرض رسائل المستخدمين\n"
     )
 
 def main():
@@ -1048,6 +1261,17 @@ def main():
         per_message=False
     )
 
+    # --- ConversationHandler للرد على الرسائل ---
+    reply_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_reply, pattern=r"^reply:")],
+        states={
+            AWAITING_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_reply)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        name="reply_conversation",
+        persistent=False,
+    )
+
     # --- ربط الأوامر العامة ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
@@ -1056,9 +1280,20 @@ def main():
     # --- ربط محادثات البوت ---
     app.add_handler(create_question_handler)  # محادثة إنشاء سؤال
     app.add_handler(manage_questions_handler) # محادثة إدارة الأسئلة
+    app.add_handler(reply_conv_handler)      # محادثة الرد على الرسائل الجديدة
 
     # --- استقبال إجابات الطلاب ---
     app.add_handler(CallbackQueryHandler(receive_answer, pattern=r"^ans:"))
+
+    # --- ربط وظائف الرسائل ---
+    app.add_handler(CallbackQueryHandler(show_user_messages, pattern=r"^show_msgs:"))
+    app.add_handler(CallbackQueryHandler(back_to_users_list, pattern=r"^back_to_users$"))
+    app.add_handler(CallbackQueryHandler(delete_message, pattern=r"^delete_msg:"))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_user_message
+    ))
+    app.add_handler(CommandHandler("messages", list_messages))
 
     # --- معالج إلغاء عام إضافي ---
     app.add_handler(CommandHandler('cancel', cancel))
